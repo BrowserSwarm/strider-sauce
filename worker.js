@@ -37,12 +37,11 @@ function getJson(filename, cb) {
 }
 
 // Is Sauce configured for this context?
-function sauceConfigured(ctx) {
-  var sauceAccessKey = ctx.jobData.repo_config.sauce_access_key
-  var sauceUsername = ctx.jobData.repo_config.sauce_username
+function sauceConfigured(config) {
+  var sauceAccessKey = config.access_key
+  var sauceUsername = config.username
 
-  if (!sauceAccessKey
-    || !sauceUsername) {
+  if (!sauceAccessKey || !sauceUsername) {
     return false
   }
 
@@ -51,13 +50,10 @@ function sauceConfigured(ctx) {
 
 // This will shut down the tunnel in a nice way
 function cleanup(ctx, cb) {
-  if (!sauceConfigured(ctx)) {
-    return cb(0)
-  }
   cleanupRun = true
   var msg = "Shutting down Sauce Connector"
   console.log(msg)
-  ctx.striderMessage(msg)
+  ctx.comment(msg)
   if (connectorProc) connectorProc.kill("SIGINT")
   // Give Sauce Connector 5 seconds to gracefully stop before sending SIGKILL
   setTimeout(function() {
@@ -65,22 +61,18 @@ function cleanup(ctx, cb) {
     fs.unlink(PIDFILE, function() {})
     msg = "Sauce Connector successfully shut down"
     console.log(msg)
-    ctx.striderMessage(msg)
+    ctx.comment(msg)
 
     return cb(0)
   }, 5000)
 }
 
 
-function test(ctx, cb) {
+function prepare(config, ctx, cb) {
 
-  if (!sauceConfigured(ctx)) {
-    return cb()
-  }
-
-  var sauceAccessKey = ctx.jobData.repo_config.sauce_access_key
-  var sauceUsername = ctx.jobData.repo_config.sauce_username
-  var sauceBrowsers = ctx.jobData.repo_config.sauce_browsers
+  var sauceAccessKey = config.access_key
+  var sauceUsername = config.username
+  var sauceBrowsers = config.browsers
 
   if (sauceBrowsers === undefined || sauceBrowsers.length === 0) {
     // Default to latest chrome on Windows Vista
@@ -94,138 +86,71 @@ function test(ctx, cb) {
   }
 
   function log(msg) {
-    ctx.striderMessage(msg)
+    ctx.comment(msg)
     console.log(msg)
   }
 
-  HTTP_PORT = ctx.browsertestPort || 8031
-
-
-  log("Waiting for webserver to come up on localhost:" + HTTP_PORT)
-
-  check({url:"http://localhost:"+HTTP_PORT+"/", log:log}, function(err) {
-    if (err) {
-      return cb(1)
-    }
-    serverUp()
-  })
 
   // Start the Sauce Connector. Returns childProcess object.
   function startConnector(username, apiKey, exitCb) {
     var jarPath = path.join(__dirname, "thirdparty", "Sauce-Connect.jar")
-    var jsh = ctx.shellWrap("exec java -Xmx64m -jar " + jarPath + " " + username + " " + apiKey)
+    var jcmd = "java"
+    var jargs = ["-Xmx64m", "-jar", jarPath, username, apiKey]
+    var screencmd = "java -Xmx64m -jar " + jarPath + " [USERNAME] [API KEY]"
     
-    ctx.striderMessage("Starting Sauce Connector")
+    ctx.comment("Starting Sauce Connector")
     var opts = {
       cwd: ctx.workingDir,
-      cmd: jsh.cmd,
-      args: jsh.args,
-      screencmd: true,
-      env: {}
+      cmd: {
+        command: jcmd,
+        args: jargs,
+        screen: screencmd
+      }
     }
-    connectorProc = ctx.forkProc(opts, exitCb)
+    connectorProc = ctx.cmd(opts, exitCb)
     // Wait until connector outputs "You may start your tests"
-    // before executing Sauce tests
+    // before returning
     connectorProc.stdout.on('data', function(data) {
       console.log(">>", data);
       if (/Connected! You may start your tests./.exec(data) !== null) {
           console.log(">> STRIDER-SAUCE :: TUNNEL READY")
-          var resultsReceived = 0
-          var buildStatus = 0
-          var resultMessages = []
-          var finished = false
-          var tasks = []
-          var sauceTimeoutSeconds = SAUCE_TEST_TIMEOUT / 1000
-          sauceBrowsers.forEach(function(browser) {
-            var worker = wd.remote("ondemand.saucelabs.com", 80, 
-              sauceUsername, sauceAccessKey)
-            var browserId = browser.browserName.replace(' ', '_') + "-" + browser.version + "-" + browser.platform.replace(" ", "-")
-            // ctx.browsertestPort and ctx.browsertestPath come from the `prepare` phase test
-            // plugin - e.g. strider-qunit.
-            var testUrl = "http://localhost:" +
-                ctx.browsertestPort + "/" + browserId + ctx.browsertestPath
-            worker.done = false
-            worker.init({
-              browserName: browser.browserName,
-              version: browser.version,
-              platform: browser.platform,
-              name: ctx.jobData.repo_config.display_url,
-              'idle-timeout': sauceTimeoutSeconds,
-              'max-duration': sauceTimeoutSeconds
-            }, function(err) {
-              if (err) {
-                log("Error creating Sauce worker: ")
-                console.dir(err)
-                return cb(1)
-              }
-              log("Created Sauce worker: " + browserId)
-              worker.title(function(err, title){ // Potentially a selenium bug - wait on the title before doing the redirect
-                log(browserId + " ... " + title + err)
-                worker.get(testUrl, function() {
-                  log("worker -> " + testUrl)
-                })
-              })
-
-            })
-
-            setTimeout(function() {
-              if (!worker.done) {
-                log("ERROR: Timeout of " + SAUCE_TEST_TIMEOUT + " ms exceeded for " + browserId + " - terminating ")
-                ctx.events.emit('testDone', { id: browserId, total:0, failed:1, passed:0, runtime: SAUCE_TEST_TIMEOUT })
-              }
-            }, SAUCE_TEST_TIMEOUT)
-            ctx.events.on('testDone', function(result) {
-              if (finished) return
-              if (result.id === browserId && worker && !worker.done) {
-                tasks.push({id:"sauce", data:{total:result.total, failed: result.failed, passed:result.passed, runtime:result.runtime, id:result.id}})
-                resultMessages.push("Results for tests on " + result.id + ": " + result.total + " total " +
-                  result.failed + " failed " + result.passed + " passed " + result.runtime + " ms runtime") 
-                if (result.failed !== 0) {
-                  buildStatus = 1
-                }
-                log("Terminating Sauce worker: " + browserId)
-                worker.quit()
-                worker.done = true
-                resultsReceived++
-              }
-              // If all the results are in, finish the build
-              if (resultsReceived == sauceBrowsers.length) {
-                finished = true
-                resultMessages.forEach(function(msg) {
-                  log(msg)
-                })
-                cb(buildStatus, tasks)
-              }
-            })
-          })
+          return cb(null, true)
       }
     })
   }
-  // Server is up, start Sauce Connector
-  function serverUp() {
-    console.log("Starting sauce connector")
-    startConnector(sauceUsername, sauceAccessKey,
-      function(exitCode) {
-      console.log("Sauce Connector exited with code: %d", exitCode)
-      // If the connector exited before the cleanup phase has run, it failed to start
-      if (!cleanupRun) {
-        log("Error starting Sauce Connector - failing test")
-        cleanupRun = true
-        fs.unlink(PIDFILE, function() {})
-        return cb(1)
-      }
-    })
-  }
+  console.log("Starting sauce connector")
+  startConnector(sauceUsername, sauceAccessKey,
+    function(exitCode) {
+    console.log("Sauce Connector exited with code: %d", exitCode)
+    // If the connector exited before the cleanup phase has run, it failed to start
+    if (!cleanupRun) {
+      log("Error starting Sauce Connector - failing test")
+      cleanupRun = true
+      fs.unlink(PIDFILE, function() {})
+      return cb(1)
+    }
+  })
 }
 
 
-module.exports = function(ctx, cb) {
+module.exports = {
+  init: function (config, job, context, done) {
+    done(null, {
 
-  ctx.addBuildHook({
-    cleanup:cleanup,
-    test:test
-  })
+      env: {
+             'BROWSERS': JSON.stringify(config.browsers)
+           , 'SAUCE_USERNAME' : config.username
+           , 'SAUCE_ACCESS_KEY' : config.access_key
+           , 'WEBDRIVER_REMOTE' : JSON.stringify({hostname: "ondemand.saucelabs.com", port: 80, username: config.username, accessKey: config.accessKey})
+           },
 
-  console.log("strider-sauce worker extension loaded")
-  cb(null, null)
+      prepare: function(ctx, done) {
+        if (sauceConfigured(config)) {
+          console.log("sauce configured")
+        }
+        prepare(config, ctx, done)
+      },
+      cleanup: cleanup
+    })
+  },
 }
